@@ -72,6 +72,32 @@ struct DeviceEditorView: View {
     // MARK: - Pieces
 
     private var header: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            titleRow
+            defaultsRow
+        }
+        .padding(.horizontal, sidePadding).padding(.top, 16).padding(.bottom, 8)
+    }
+
+    /// "Default Output/Input" pins: apps that cannot pick a device (games) follow the system default, and macOS
+    /// moves it on its own when AirPods connect. Pinning keeps them on this virtual device.
+    private var defaultsRow: some View {
+        HStack(spacing: 16) {
+            Toggle("Default Output", isOn: Binding(get: { device.isDefaultOutput }, set: { store.setDefaultOutput(device.id, $0) }))
+                .toggleStyle(.checkbox)
+                .help("Keep this device as the system output. Everything that plays to the default output lands in Pass-Thru.")
+            Toggle("Default Input", isOn: Binding(get: { device.isDefaultInput }, set: { store.setDefaultInput(device.id, $0) }))
+                .toggleStyle(.checkbox)
+                .help("Keep this device as the system input. Apps using the default microphone receive this device's mix.")
+            Text("System now: output \(store.deviceName(uid: store.system.defaultOutputUID)) · input \(store.deviceName(uid: store.system.defaultInputUID))")
+                .font(.callout).foregroundStyle(Theme.textSecondary).lineLimit(1).truncationMode(.middle)
+            Spacer()
+        }
+        .disabled(!device.isOn)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var titleRow: some View {
         HStack(spacing: 8) {
             if editingName {
                 TextField("Device name", text: $draftName)
@@ -90,7 +116,6 @@ struct DeviceEditorView: View {
             }
             Spacer()
         }
-        .padding(.horizontal, sidePadding).padding(.top, 16).padding(.bottom, 8)
     }
 
     private func columns(gap: CGFloat) -> some View {

@@ -60,4 +60,28 @@ final class MixKernelTests: XCTestCase {
         let outs = run(k, input: [1, 0, 1, 0], outputCount: 2, frames: 2)
         XCTAssertEqual(outs[0], [0, 1, 0, 1])
     }
+
+    func testDirectWireBypassesBusesAndMaster() {
+        let k = MixKernel(maxFrames: 2, maxBuses: 2)
+        var p = makePlan(); p.inputs[0].gain = 1; p.masterGain = 0
+        p.inputToBus = []; p.busToOutput = []
+        p.inputToOutput = [.init(0, 0, 1, 1)]   // input L -> monitor R, monitor gain 0.25
+        k.install(p)
+        let outs = run(k, input: [1, 0, 1, 0], outputCount: 2, frames: 2)
+        XCTAssertEqual(outs[0], [0, 0, 0, 0])
+        XCTAssertEqual(outs[1], [0, 0.25, 0, 0.25])
+    }
+
+    func testDelayedInputReachesBusLater() {
+        let k = MixKernel(maxFrames: 4, maxBuses: 2)
+        var p = makePlan(); p.inputs[0].gain = 1; p.inputs[0].delayFrames = 2
+        p.inputToBus = [.init(0, 0, 0)]; p.busToOutput = [.init(0, 0, 0)]
+        p.inputToOutput = [.init(0, 0, 1, 0)]
+        k.install(p)
+        let outs = run(k, input: [1, 0, 2, 0, 3, 0, 4, 0], outputCount: 2, frames: 4)
+        XCTAssertEqual(outs[0], [0, 0, 0, 0, 1, 0, 2, 0])          // bus path delayed by 2 frames
+        XCTAssertEqual(outs[1], [0.25, 0, 0.5, 0, 0.75, 0, 1, 0])  // direct path undelayed
+        let outs2 = run(k, input: [5, 0, 6, 0, 7, 0, 8, 0], outputCount: 2, frames: 4)
+        XCTAssertEqual(outs2[0], [3, 0, 4, 0, 5, 0, 6, 0])
+    }
 }

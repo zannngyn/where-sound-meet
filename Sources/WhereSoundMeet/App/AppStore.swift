@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import WhereSoundMeetCore
 import Observation
@@ -11,8 +12,10 @@ final class AppStore {
 
     let engine: AudioEngine
     let system: AudioSystem
+    private let pinner = DefaultDevicePinner()
     private let store: DeviceStore
     private var saveTask: Task<Void, Never>?
+    private var quitObserver: NSObjectProtocol?
 
     init(store: DeviceStore = DeviceStore(url: DeviceStore.defaultURL)) {
         self.store = store
@@ -21,8 +24,17 @@ final class AppStore {
         devices = Self.canonicalizeAppSources((try? store.load()) ?? [])
         selectedID = devices.first?.id
         system.onChange = { [weak self] in self?.engine.processesChanged() }
-        system.onDevicesChange = { [weak self] in self?.engine.hardwareChanged() }
+        system.onDevicesChange = { [weak self] in
+            guard let self else { return }
+            engine.hardwareChanged()
+            pinner.apply(devices: devices)
+        }
+        system.onDefaultsChange = { [weak self] in self?.pinner.defaultsChanged() }
         engine.apply(devices)
+        pinner.apply(devices: devices)
+        quitObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pinner.releaseAll() }
+        }
     }
 
     var selected: VirtualDevice? { devices.first { $0.id == selectedID } }
@@ -62,6 +74,25 @@ final class AppStore {
     }
 
     func setOn(_ id: UUID, _ on: Bool) { mutate(id) { $0.isOn = on } }
+
+    /// Only one device can hold each default; turning it on for one clears it on the others.
+    func setDefaultOutput(_ id: UUID, _ on: Bool) {
+        for i in devices.indices { devices[i].isDefaultOutput = on && devices[i].id == id }
+        commit()
+    }
+
+    func setDefaultInput(_ id: UUID, _ on: Bool) {
+        for i in devices.indices { devices[i].isDefaultInput = on && devices[i].id == id }
+        commit()
+    }
+
+    /// Display name for a device UID, including our own virtual devices (hidden from the system lists).
+    func deviceName(uid: String?) -> String {
+        guard let uid else { return "none" }
+        if let d = devices.first(where: { $0.driverUID == uid }) { return d.name }
+        if let d = (system.outputDevices + system.inputDevices).first(where: { $0.uid == uid }) { return d.name }
+        return AudioSystem.allDevices().first { $0.uid == uid }?.name ?? uid
+    }
     func setVolume(_ id: UUID, _ v: Float) { mutate(id) { $0.volume = v } }
 
     func retryDriver() { engine.apply(devices) }
@@ -97,6 +128,7 @@ final class AppStore {
 
     private func commit() {
         engine.apply(devices)
+        pinner.apply(devices: devices)
         saveTask?.cancel()
         let snapshot = devices
         saveTask = Task { [store] in

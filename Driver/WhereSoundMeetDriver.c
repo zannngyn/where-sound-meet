@@ -14,6 +14,9 @@ static LBDevice gDevices[kLB_MaxDevices];
 static pthread_mutex_t gStateMutex = PTHREAD_MUTEX_INITIALIZER;
 static ULONG gRefCount = 0;
 static os_log_t gLog;
+static const Float64 kLB_Rates[kLB_RateCount] = { 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0 };
+static Float64 gTicksPerSecond = 0;
+static bool LB_RateSupported(Float64 r) { for (int i = 0; i < kLB_RateCount; i++) if (kLB_Rates[i] == r) return true; return false; }
 static OSStatus gLastNotifyStatus = 0;
 static UInt32 gNotifyCount = 0;
 
@@ -192,9 +195,11 @@ static OSStatus LB_Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHos
     gLog = os_log_create(kLB_BundleID, "driver");
     mach_timebase_info_data_t tb;
     mach_timebase_info(&tb);
-    Float64 ticksPerFrame = ((Float64)tb.denom / (Float64)tb.numer) * 1.0e9 / kLB_SampleRate;
+    gTicksPerSecond = ((Float64)tb.denom / (Float64)tb.numer) * 1.0e9;
+    Float64 ticksPerFrame = gTicksPerSecond / kLB_SampleRate;
     for (int i = 0; i < kLB_MaxDevices; i++) {
         memset(&gDevices[i], 0, sizeof(LBDevice));
+        gDevices[i].sampleRate = kLB_SampleRate;
         gDevices[i].ring = calloc((size_t)kLB_RingFrames * kLB_Channels, sizeof(Float32));
         gDevices[i].passRing = calloc((size_t)kLB_RingFrames * kLB_Channels, sizeof(Float32));
         gDevices[i].hostTicksPerFrame = ticksPerFrame;
@@ -223,10 +228,21 @@ static OSStatus LB_AddDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID d
     if (!LB_IsDeviceID(dev)) return kAudioHardwareBadObjectError;
     LBDevice* s = &gDevices[LB_SlotForID(dev)];
     pthread_mutex_lock(&gStateMutex);
-    if (s->clientCount < kLB_MaxClients) {
+    bool found = false;
+    for (UInt32 i = 0; i < s->clientCount; i++) {
+        if (s->clients[i].id != info->mClientID) continue;
+        s->clients[i].pid = info->mProcessID;
+        found = true;
+        break;
+    }
+    if (!found && s->clientCount < kLB_MaxClients) {
         s->clients[s->clientCount].id = info->mClientID;
         s->clients[s->clientCount].pid = info->mProcessID;
         s->clientCount++;
+    } else if (!found) {
+        // Untracked clients can never be recognised as the owner; make it visible instead of silent.
+        s->nClientsDropped++;
+        os_log_error(gLog, "slot %d client table full, dropping client %u pid %d", (int)LB_SlotForID(dev), (unsigned)info->mClientID, (int)info->mProcessID);
     }
     pthread_mutex_unlock(&gStateMutex);
     return 0;
@@ -254,7 +270,19 @@ static OSStatus LB_RemoveDeviceClient(AudioServerPlugInDriverRef d, AudioObjectI
 }
 
 static OSStatus LB_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt64 a, void* i) {
-    (void)d; (void)dev; (void)a; (void)i; return 0;
+    (void)d; (void)i;
+    if (!LB_IsDeviceID(dev)) return kAudioHardwareBadObjectError;
+    LBDevice* s = &gDevices[LB_SlotForID(dev)];
+    Float64 rate = (Float64)a;
+    if (!LB_RateSupported(rate)) return kAudioHardwareIllegalOperationError;
+    pthread_mutex_lock(&s->ioMutex);
+    s->sampleRate = rate;
+    s->hostTicksPerFrame = gTicksPerSecond / rate;
+    s->anchorHostTime = mach_absolute_time();
+    s->periodCounter = 0;
+    pthread_mutex_unlock(&s->ioMutex);
+    os_log(gLog, "slot %d sample rate -> %d", (int)LB_SlotForID(dev), (int)rate);
+    return 0;
 }
 static OSStatus LB_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt64 a, void* i) {
     (void)d; (void)dev; (void)a; (void)i; return 0;
@@ -326,10 +354,10 @@ static OSStatus LB_IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectI
     return 0;
 }
 
-static AudioStreamBasicDescription LB_Format(void) {
+static AudioStreamBasicDescription LB_Format(Float64 rate) {
     AudioStreamBasicDescription f;
     memset(&f, 0, sizeof(f));
-    f.mSampleRate = kLB_SampleRate;
+    f.mSampleRate = rate;
     f.mFormatID = kAudioFormatLinearPCM;
     f.mFormatFlags = kAudioFormatFlagsNativeFloatPacked;
     f.mBytesPerPacket = kLB_Channels * sizeof(Float32);
@@ -409,6 +437,16 @@ static OSStatus LB_GetPlugInProperty(const AudioObjectPropertyAddress* a, UInt32
             CFMutableStringRef str = CFStringCreateMutable(NULL, 0);
             CFStringAppendFormat(str, NULL, CFSTR("host=%d active=%d notifies=%u lastNotifyStatus=%d\n"),
                                  gHost != NULL, active, (unsigned)gNotifyCount, (int)gLastNotifyStatus);
+            for (int i = 0; i < kLB_MaxDevices; i++) {
+                const LBDevice* d = &gDevices[i];
+                if (!d->active) continue;
+                CFStringAppendFormat(str, NULL, CFSTR("slot%d owner=%d io=%u start/stop=%llu/%llu rate=%.0f period=%llu clients=%u dropped=%llu\n"
+                                                      "  ring: frontier=%llu writes(procOwner/procAll/mix)=%llu/%llu/%llu lastWrite@%llu peak=%.4f reads=%llu lastRead@%llu peak=%.4f maxBehind w/r=%llu/%llu\n"
+                                                      "  pass: frontier=%llu reads=%llu lastRead@%llu peak=%.4f maxBehind w/r=%llu/%llu\n"),
+                                     i, (int)d->ownerPID, (unsigned)d->ioCount, d->nStart, d->nStop, d->sampleRate, d->periodCounter, (unsigned)d->clientCount, d->nClientsDropped,
+                                     d->ringFrontier, d->nProcOutOwner, d->nProcOut, d->nWriteMix, d->lastWriteStart, d->lastWritePeak, d->nRead, d->lastReadStart, d->lastReadPeak, d->ringMaxBehind, d->ringMaxReadBehind,
+                                     d->passFrontier, d->nCapRead, d->lastCapReadStart, d->lastCapReadPeak, d->passMaxBehind, d->passMaxReadBehind);
+            }
             UInt32 head = gTraceHead;
             UInt32 start = head > kLB_TraceSize ? head - kLB_TraceSize : 0;
             for (UInt32 i = start; i < head; i++) {
@@ -483,17 +521,19 @@ static OSStatus LB_GetDeviceProperty(AudioObjectID obj, const AudioObjectPropert
         case kAudioDevicePropertySafetyOffset: LB_RETURN_VALUE(UInt32, kLB_SafetyOffset);
         case kAudioDevicePropertyZeroTimeStampPeriod: LB_RETURN_VALUE(UInt32, kLB_ZeroTSPeriod);
         case kAudioDevicePropertyIsHidden: LB_RETURN_VALUE(UInt32, cap ? 1 : 0);
-        case kAudioDevicePropertyNominalSampleRate: LB_RETURN_VALUE(Float64, kLB_SampleRate);
+        case kAudioDevicePropertyNominalSampleRate: LB_RETURN_VALUE(Float64, s->sampleRate);
         case kAudioDevicePropertyAvailableNominalSampleRates: {
-            AudioValueRange r = { kLB_SampleRate, kLB_SampleRate };
-            if (outData && inSize < sizeof(r)) { *outSize = 0; return 0; }
-            LB_RETURN_VALUE(AudioValueRange, r);
+            UInt32 n = outData ? inSize / sizeof(AudioValueRange) : kLB_RateCount;
+            if (n > kLB_RateCount) n = kLB_RateCount;
+            *outSize = n * sizeof(AudioValueRange);
+            if (outData) for (UInt32 i = 0; i < n; i++) { ((AudioValueRange*)outData)[i].mMinimum = kLB_Rates[i]; ((AudioValueRange*)outData)[i].mMaximum = kLB_Rates[i]; }
+            return 0;
         }
         case kAudioObjectPropertyOwnedObjects:
         case kAudioDevicePropertyStreams: {
             AudioObjectID ids[2]; UInt32 n = 0;
             if (a->mScope == kAudioObjectPropertyScopeGlobal || a->mScope == kAudioObjectPropertyScopeInput) ids[n++] = cap ? LB_CapInStreamID(slot) : LB_InStreamID(slot);
-            if (!cap && (a->mScope == kAudioObjectPropertyScopeGlobal || a->mScope == kAudioObjectPropertyScopeOutput)) ids[n++] = LB_OutStreamID(slot);
+            if (a->mScope == kAudioObjectPropertyScopeGlobal || a->mScope == kAudioObjectPropertyScopeOutput) ids[n++] = cap ? LB_CapOutStreamID(slot) : LB_OutStreamID(slot);
             UInt32 max = outData ? inSize / sizeof(AudioObjectID) : n;
             if (max < n) n = max;
             *outSize = n * sizeof(AudioObjectID);
@@ -540,25 +580,31 @@ static OSStatus LB_GetDeviceProperty(AudioObjectID obj, const AudioObjectPropert
 
 static OSStatus LB_GetStreamProperty(AudioObjectID obj, const AudioObjectPropertyAddress* a, UInt32 inSize, UInt32* outSize, void* outData) {
     bool isInput = LB_IsInStream(obj) || LB_IsCapInStream(obj);
+    bool onCap = LB_IsCapInStream(obj) || LB_IsCapOutStream(obj);
+    Float64 rate = gDevices[LB_SlotForID(obj)].sampleRate;
     switch (a->mSelector) {
         case kAudioObjectPropertyBaseClass: LB_RETURN_VALUE(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass: LB_RETURN_VALUE(AudioClassID, kAudioStreamClassID);
-        case kAudioObjectPropertyOwner: LB_RETURN_VALUE(AudioObjectID, LB_DeviceID(LB_SlotForID(obj)));
+        case kAudioObjectPropertyOwner: LB_RETURN_VALUE(AudioObjectID, onCap ? LB_CapDeviceID(LB_SlotForID(obj)) : LB_DeviceID(LB_SlotForID(obj)));
         case kAudioStreamPropertyIsActive: LB_RETURN_VALUE(UInt32, 1);
         case kAudioStreamPropertyDirection: LB_RETURN_VALUE(UInt32, isInput ? 1 : 0);
         case kAudioStreamPropertyTerminalType: LB_RETURN_VALUE(UInt32, isInput ? kAudioStreamTerminalTypeMicrophone : kAudioStreamTerminalTypeSpeaker);
         case kAudioStreamPropertyStartingChannel: LB_RETURN_VALUE(UInt32, 1);
         case kAudioStreamPropertyLatency: LB_RETURN_VALUE(UInt32, 0);
         case kAudioStreamPropertyVirtualFormat:
-        case kAudioStreamPropertyPhysicalFormat: LB_RETURN_VALUE(AudioStreamBasicDescription, LB_Format());
+        case kAudioStreamPropertyPhysicalFormat: LB_RETURN_VALUE(AudioStreamBasicDescription, LB_Format(rate));
         case kAudioStreamPropertyAvailableVirtualFormats:
         case kAudioStreamPropertyAvailablePhysicalFormats: {
-            AudioStreamRangedDescription r;
-            r.mFormat = LB_Format();
-            r.mSampleRateRange.mMinimum = kLB_SampleRate;
-            r.mSampleRateRange.mMaximum = kLB_SampleRate;
-            if (outData && inSize < sizeof(r)) { *outSize = 0; return 0; }
-            LB_RETURN_VALUE(AudioStreamRangedDescription, r);
+            UInt32 n = outData ? inSize / sizeof(AudioStreamRangedDescription) : kLB_RateCount;
+            if (n > kLB_RateCount) n = kLB_RateCount;
+            *outSize = n * sizeof(AudioStreamRangedDescription);
+            if (outData) for (UInt32 i = 0; i < n; i++) {
+                AudioStreamRangedDescription* r = &((AudioStreamRangedDescription*)outData)[i];
+                r->mFormat = LB_Format(kLB_Rates[i]);
+                r->mSampleRateRange.mMinimum = kLB_Rates[i];
+                r->mSampleRateRange.mMaximum = kLB_Rates[i];
+            }
+            return 0;
         }
         default: return kAudioHardwareUnknownPropertyError;
     }
@@ -611,7 +657,11 @@ static OSStatus LB_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID o
             }
             case kAudioDevicePropertyNominalSampleRate: {
                 if (inSize < sizeof(Float64)) return kAudioHardwareBadPropertySizeError;
-                return *(const Float64*)inData == kLB_SampleRate ? 0 : kAudioHardwareIllegalOperationError;
+                Float64 rate = *(const Float64*)inData;
+                if (!LB_RateSupported(rate)) return kAudioHardwareIllegalOperationError;
+                if (rate == s->sampleRate) return 0;
+                // Both the main and the capture device change together: request on the main device.
+                return gHost->RequestDeviceConfigurationChange(gHost, LB_DeviceID(LB_SlotForID(obj)), (UInt64)rate, NULL);
             }
             default: return kAudioHardwareUnknownPropertyError;
         }
@@ -620,9 +670,12 @@ static OSStatus LB_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID o
         if (a->mSelector == kAudioStreamPropertyVirtualFormat || a->mSelector == kAudioStreamPropertyPhysicalFormat) {
             if (inSize < sizeof(AudioStreamBasicDescription)) return kAudioHardwareBadPropertySizeError;
             const AudioStreamBasicDescription* f = inData;
-            AudioStreamBasicDescription want = LB_Format();
-            bool same = f->mSampleRate == want.mSampleRate && f->mFormatID == want.mFormatID && f->mChannelsPerFrame == want.mChannelsPerFrame && f->mBitsPerChannel == want.mBitsPerChannel;
-            return same ? 0 : kAudioDeviceUnsupportedFormatError;
+            LBDevice* s = &gDevices[LB_SlotForID(obj)];
+            AudioStreamBasicDescription want = LB_Format(f->mSampleRate);
+            bool same = LB_RateSupported(f->mSampleRate) && f->mFormatID == want.mFormatID && f->mChannelsPerFrame == want.mChannelsPerFrame && f->mBitsPerChannel == want.mBitsPerChannel;
+            if (!same) return kAudioDeviceUnsupportedFormatError;
+            if (f->mSampleRate == s->sampleRate) return 0;
+            return gHost->RequestDeviceConfigurationChange(gHost, LB_DeviceID(LB_SlotForID(obj)), (UInt64)f->mSampleRate, NULL);
         }
         return kAudioHardwareUnknownPropertyError;
     }
@@ -648,11 +701,18 @@ static OSStatus LB_StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt
         pthread_mutex_lock(&s->ioMutex);
         s->anchorHostTime = mach_absolute_time();
         s->periodCounter = 0;
+        os_unfair_lock_lock(&s->ringLock);
         memset(s->ring, 0, sizeof(Float32) * kLB_RingFrames * kLB_Channels);
+        s->ringFrontier = 0;
+        os_unfair_lock_unlock(&s->ringLock);
+        os_unfair_lock_lock(&s->passLock);
         memset(s->passRing, 0, sizeof(Float32) * kLB_RingFrames * kLB_Channels);
+        s->passFrontier = 0;
+        os_unfair_lock_unlock(&s->passLock);
         pthread_mutex_unlock(&s->ioMutex);
     }
     s->ioCount++;
+    s->nStart++;
     pthread_mutex_unlock(&gStateMutex);
     LB_NotifyRunning(dev);
     return 0;
@@ -664,6 +724,7 @@ static OSStatus LB_StopIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt3
     LBDevice* s = &gDevices[LB_SlotForID(dev)];
     pthread_mutex_lock(&gStateMutex);
     if (s->ioCount > 0) s->ioCount--;
+    s->nStop++;
     pthread_mutex_unlock(&gStateMutex);
     LB_NotifyRunning(dev);
     return 0;
@@ -676,10 +737,13 @@ static OSStatus LB_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID 
     pthread_mutex_lock(&s->ioMutex);
     UInt64 now = mach_absolute_time();
     Float64 ticksPerPeriod = s->hostTicksPerFrame * kLB_ZeroTSPeriod;
-    UInt64 nextHost = s->anchorHostTime + (UInt64)((Float64)(s->periodCounter + 1) * ticksPerPeriod);
-    if (now >= nextHost) s->periodCounter++;
-    *outSampleTime = (Float64)(s->periodCounter * kLB_ZeroTSPeriod);
-    *outHostTime = s->anchorHostTime + (UInt64)((Float64)s->periodCounter * ticksPerPeriod);
+    // Deterministic from the shared anchor: the main and capture devices of one slot then report the
+    // exact same timeline, so a write on one lands at the sample time the other reads. An incrementing
+    // counter drifts when the host clocks the two devices independently -> comb filtering.
+    UInt64 period = now > s->anchorHostTime ? (UInt64)(((Float64)(now - s->anchorHostTime)) / ticksPerPeriod) : 0;
+    s->periodCounter = period;
+    *outSampleTime = (Float64)(period * kLB_ZeroTSPeriod);
+    *outHostTime = s->anchorHostTime + (UInt64)((Float64)period * ticksPerPeriod);
     *outSeed = 1;
     pthread_mutex_unlock(&s->ioMutex);
     return 0;
@@ -687,8 +751,8 @@ static OSStatus LB_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID 
 
 static OSStatus LB_WillDoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client, UInt32 op, Boolean* willDo, Boolean* inPlace) {
     (void)d; (void)client;
-    if (LB_IsCapDeviceID(dev)) *willDo = (op == kAudioServerPlugInIOOperationReadInput);
-    else *willDo = (op == kAudioServerPlugInIOOperationReadInput || op == kAudioServerPlugInIOOperationProcessOutput || op == kAudioServerPlugInIOOperationWriteMix);
+    (void)dev;
+    *willDo = (op == kAudioServerPlugInIOOperationReadInput || op == kAudioServerPlugInIOOperationWriteMix);
     *inPlace = true;
     return 0;
 }
@@ -700,47 +764,79 @@ static OSStatus LB_EndIOOperation(AudioServerPlugInDriverRef d, AudioObjectID de
     (void)d; (void)dev; (void)c; (void)op; (void)n; (void)i; return 0;
 }
 
-static pid_t LB_ClientPID(const LBDevice* s, UInt32 clientID) {
+__attribute__((unused)) static pid_t LB_ClientPID(const LBDevice* s, UInt32 clientID) {
     UInt32 n = s->clientCount;
     for (UInt32 i = 0; i < n && i < kLB_MaxClients; i++) if (s->clients[i].id == clientID) return s->clients[i].pid;
     return -1;
 }
 
-static void LB_RingAdd(Float32* ring, UInt64 start, const Float32* buf, UInt32 frames) {
+// Mixes `buf` into the ring at `start`. Frames past the frontier are zeroed first, so stale data from
+// the previous lap never leaks and several writers can accumulate into the same block.
+static void LB_RingWrite(Float32* ring, UInt64* frontier, os_unfair_lock* lock, UInt64 start, const Float32* buf, UInt32 frames, UInt64* maxBehind) {
     const UInt64 mask = kLB_RingFrames - 1;
+    const UInt64 end = start + frames;
+    os_unfair_lock_lock(lock);
+    if (start < *frontier && *frontier - start > *maxBehind) *maxBehind = *frontier - start;
+    UInt64 from = start > *frontier ? start : *frontier;
+    if (end > kLB_RingFrames && from < end - kLB_RingFrames) from = end - kLB_RingFrames;   // never clear more than one lap
+    for (UInt64 t = from; t < end; t++) {
+        Float32* dst = ring + (t & mask) * kLB_Channels;
+        dst[0] = 0; dst[1] = 0;
+    }
     for (UInt32 f = 0; f < frames; f++) {
         Float32* dst = ring + ((start + f) & mask) * kLB_Channels;
         dst[0] += buf[f * kLB_Channels];
         dst[1] += buf[f * kLB_Channels + 1];
     }
+    if (end > *frontier) *frontier = end;
+    os_unfair_lock_unlock(lock);
+}
+
+static Float32 LB_Peak(const Float32* buf, UInt32 frames) {
+    Float32 m = 0;
+    for (UInt32 i = 0; i < frames * kLB_Channels; i++) { Float32 v = buf[i] < 0 ? -buf[i] : buf[i]; if (v > m) m = v; }
+    return m;
+}
+
+// Copies frames out without touching the ring; anything not yet written this lap reads as silence.
+static void LB_RingRead(const Float32* ring, const UInt64* frontier, os_unfair_lock* lock, UInt64 start, Float32* buf, UInt32 frames, UInt64* maxBehind) {
+    const UInt64 mask = kLB_RingFrames - 1;
+    os_unfair_lock_lock(lock);
+    const UInt64 valid = *frontier;
+    if (start < valid && valid - start > *maxBehind) *maxBehind = valid - start;
+    for (UInt32 f = 0; f < frames; f++) {
+        const UInt64 t = start + f;
+        const Float32* src = ring + (t & mask) * kLB_Channels;
+        buf[f * kLB_Channels] = t < valid ? src[0] : 0;
+        buf[f * kLB_Channels + 1] = t < valid ? src[1] : 0;
+    }
+    os_unfair_lock_unlock(lock);
 }
 
 static OSStatus LB_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID dev, AudioObjectID stream, UInt32 client, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo* cycle, void* mainBuf, void* secBuf) {
-    (void)d; (void)stream; (void)secBuf;
+    (void)d; (void)stream; (void)secBuf; (void)client;
     if (!LB_IsDeviceID(dev)) return kAudioHardwareBadObjectError;
     LBDevice* s = &gDevices[LB_SlotForID(dev)];
     Float32* buf = (Float32*)mainBuf;
-    const UInt64 mask = kLB_RingFrames - 1;
+    bool onCap = LB_IsCapDeviceID(dev);
     if (op == kAudioServerPlugInIOOperationReadInput) {
-        Float32* ring = LB_IsCapDeviceID(dev) ? s->passRing : s->ring;
         UInt64 start = (UInt64)cycle->mInputTime.mSampleTime;
-        for (UInt32 f = 0; f < frames; f++) {
-            Float32* src = ring + ((start + f) & mask) * kLB_Channels;
-            buf[f * kLB_Channels] = src[0];
-            buf[f * kLB_Channels + 1] = src[1];
-            src[0] = 0; src[1] = 0;
-        }
-    } else if (op == kAudioServerPlugInIOOperationProcessOutput) {
-        // Owned device: only the owner app's output is looped back. Other clients' audio is left
-        // untouched so the app can capture it through a process tap (Pass-Thru) and route it itself.
-        pid_t owner = s->ownerPID;
-        if (owner != 0) {
-            bool isOwner = LB_ClientPID(s, client) == owner;
-            LB_RingAdd(isOwner ? s->ring : s->passRing, (UInt64)cycle->mOutputTime.mSampleTime, buf, frames);
+        if (onCap) {   // app reads what everything played
+            LB_RingRead(s->passRing, &s->passFrontier, &s->passLock, start, buf, frames, &s->passMaxReadBehind);
+            s->nCapRead++; s->lastCapReadStart = start; s->lastCapReadPeak = LB_Peak(buf, frames);
+        } else {       // game records the app's mix as its mic
+            LB_RingRead(s->ring, &s->ringFrontier, &s->ringLock, start, buf, frames, &s->ringMaxReadBehind);
+            s->nRead++; s->lastReadStart = start; s->lastReadPeak = LB_Peak(buf, frames);
         }
     } else if (op == kAudioServerPlugInIOOperationWriteMix) {
-        // Unowned device: plain loopback of the full mix (BlackHole-style).
-        if (s->ownerPID == 0) LB_RingAdd(s->ring, (UInt64)cycle->mOutputTime.mSampleTime, buf, frames);
+        UInt64 start = (UInt64)cycle->mOutputTime.mSampleTime;
+        if (onCap) {   // app writes its mix -> games hear it on the main device input
+            LB_RingWrite(s->ring, &s->ringFrontier, &s->ringLock, start, buf, frames, &s->ringMaxBehind);
+            s->nProcOutOwner++; s->lastWriteStart = start; s->lastWritePeak = LB_Peak(buf, frames);
+        } else {       // everything played to the main device -> Pass-Thru
+            LB_RingWrite(s->passRing, &s->passFrontier, &s->passLock, start, buf, frames, &s->passMaxBehind);
+            s->nWriteMix++;
+        }
     }
     return 0;
 }

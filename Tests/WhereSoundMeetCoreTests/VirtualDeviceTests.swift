@@ -71,4 +71,43 @@ final class VirtualDeviceTests: XCTestCase {
         d.addSource(.inputDevice(uid: "m", name: "M"))
         XCTAssertEqual(d.sourcesSummary, "2 Apps, 1 Device, Pass-Thru")
     }
+
+    func testSourceToMonitorWireIsValid() {
+        var d = VirtualDevice.makeDefault()
+        let m = d.addMonitor(deviceUID: "out", name: "Out")
+        let direct = Wire(from: Endpoint(nodeID: d.sources[0].id, channel: 0), to: Endpoint(nodeID: m.id, channel: 1))
+        XCTAssertTrue(d.isValid(direct))
+        d.toggleWire(direct)
+        XCTAssertTrue(d.wires.contains(direct))
+        d.remove(nodeID: m.id)
+        XCTAssertFalse(d.wires.contains(direct))
+    }
+
+    func testDefaultFlagsAndDelayRoundTrip() throws {
+        var d = VirtualDevice.makeDefault()
+        d.isDefaultOutput = true
+        d.isDefaultInput = true
+        d.sources[0].delayMs = 180
+        let data = try JSONEncoder().encode([d])
+        let back = try JSONDecoder().decode([VirtualDevice].self, from: data)
+        XCTAssertEqual(back, [d])
+        XCTAssertEqual(back[0].sources[0].delayMs, 180)
+        // Old configs without the new keys still load.
+        let old = try JSONDecoder().decode([VirtualDevice].self, from: Data("""
+        [{"id":"1A4BE0F4-E8D1-4AAC-9CC6-5558CEE2BB4F","name":"X","sources":[{"id":"13D2F72F-B7AC-4ED5-BEE5-B316B0381844","kind":{"passThru":{}}}],"outputChannels":[],"monitors":[],"wires":[]}]
+        """.utf8))
+        XCTAssertFalse(old[0].isDefaultOutput)
+        XCTAssertEqual(old[0].sources[0].delayMs, 0)
+    }
+}
+
+extension VirtualDeviceTests {
+    /// Muting a voice-chat app's own output while tapping it broke its playout; capture must default to non-muting.
+    func testAppSourceDoesNotMuteOriginalByDefault() throws {
+        let s = Source(kind: .app(bundleID: "com.hnc.Discord", name: "Discord"))
+        XCTAssertFalse(s.muteOriginal)
+        let json = #"{"id":"1A4BE0F4-E8D1-4AAC-9CC6-5558CEE2BB4F","kind":{"app":{"bundleID":"com.hnc.Discord","name":"Discord"}}}"#
+        let decoded = try JSONDecoder().decode(Source.self, from: Data(json.utf8))
+        XCTAssertFalse(decoded.muteOriginal)
+    }
 }

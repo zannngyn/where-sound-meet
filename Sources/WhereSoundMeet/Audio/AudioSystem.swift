@@ -30,13 +30,21 @@ final class AudioSystem {
     private(set) var inputDevices: [AudioDeviceInfo] = []
     private(set) var outputDevices: [AudioDeviceInfo] = []
     private(set) var processes: [AudioProcessInfo] = []
+    private(set) var defaultOutputUID: String?
+    private(set) var defaultInputUID: String?
     var onChange: (() -> Void)?
     var onDevicesChange: (() -> Void)?
+    var onDefaultsChange: (() -> Void)?
     private var listenerBlock: AudioObjectPropertyListenerBlock?
+    private var defaultsListenerBlock: AudioObjectPropertyListenerBlock?
     private var lastDeviceUIDs: [String] = []
+
+    static let defaultSelectors = [kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDefaultSystemOutputDevice,
+                                   kAudioHardwarePropertyDefaultInputDevice]
 
     init() {
         refresh()
+        refreshDefaults()
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             Task { @MainActor in self?.refresh() }
         }
@@ -46,6 +54,24 @@ final class AudioSystem {
                                                   mElement: kAudioObjectPropertyElementMain)
             AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, .main, block)
         }
+        let defaults: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            Task { @MainActor in self?.refreshDefaults() }
+        }
+        defaultsListenerBlock = defaults
+        for selector in Self.defaultSelectors {
+            var addr = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
+                                                  mElement: kAudioObjectPropertyElementMain)
+            AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, .main, defaults)
+        }
+    }
+
+    func refreshDefaults() {
+        let out = Self.defaultDeviceUID(kAudioHardwarePropertyDefaultOutputDevice)
+        let inp = Self.defaultDeviceUID(kAudioHardwarePropertyDefaultInputDevice)
+        let changed = out != defaultOutputUID || inp != defaultInputUID
+        defaultOutputUID = out
+        defaultInputUID = inp
+        if changed { onDefaultsChange?() }
     }
 
     func refresh() {
@@ -78,6 +104,37 @@ final class AudioSystem {
                                        UInt32(MemoryLayout<CFString>.size), qual, &size, &id)
         }
         return status == noErr && id != kAudioObjectUnknown ? id : nil
+    }
+
+    nonisolated static func defaultDeviceUID(_ selector: AudioObjectPropertySelector) -> String? {
+        let id: AudioObjectID = scalarProperty(AudioObjectID(kAudioObjectSystemObject), selector) ?? kAudioObjectUnknown
+        guard id != kAudioObjectUnknown else { return nil }
+        return stringProperty(id, kAudioDevicePropertyDeviceUID)
+    }
+
+    /// Makes `uid` the system default for `selector`; returns false if the device is absent or the HAL refused.
+    @discardableResult
+    nonisolated static func setDefaultDevice(uid: String, _ selector: AudioObjectPropertySelector) -> Bool {
+        guard var id = deviceID(forUID: uid) else { return false }
+        var addr = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil,
+                                          UInt32(MemoryLayout<AudioObjectID>.size), &id) == noErr
+    }
+
+    /// Output latency the device reports (device latency + safety offset), in ms. Bluetooth devices report the big numbers.
+    nonisolated static func outputLatencyMs(uid: String) -> Double? {
+        guard let id = deviceID(forUID: uid) else { return nil }
+        func u32(_ sel: AudioObjectPropertySelector) -> UInt32 {
+            var addr = AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeOutput,
+                                                  mElement: kAudioObjectPropertyElementMain)
+            var v: UInt32 = 0
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            return AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &v) == noErr ? v : 0
+        }
+        let rate: Float64 = scalarProperty(id, kAudioDevicePropertyNominalSampleRate) ?? 0
+        guard rate > 0 else { return nil }
+        return Double(u32(kAudioDevicePropertyLatency) + u32(kAudioDevicePropertySafetyOffset)) / rate * 1000
     }
 
     nonisolated static func defaultOutputDevice() -> AudioDeviceInfo? {
