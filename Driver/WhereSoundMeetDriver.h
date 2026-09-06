@@ -1,15 +1,17 @@
 #pragma once
 #include <CoreAudio/AudioServerPlugIn.h>
+#include <os/lock.h>
 #include <pthread.h>
 #include <stdbool.h>
 
 #define kLB_MaxDevices        8
-#define kLB_MaxClients        64
+#define kLB_MaxClients        512          /* every process using the device as system default is a client */
 #define kLB_Channels          2
-#define kLB_SampleRate        48000.0
-#define kLB_RingFrames        16384          /* power of two */
+#define kLB_SampleRate        48000.0          /* default */
+#define kLB_RateCount         6
+#define kLB_RingFrames        262144         /* power of two; ~5.4 s so writers with very different latencies never collide */
 #define kLB_ZeroTSPeriod      4096
-#define kLB_SafetyOffset      96
+#define kLB_SafetyOffset      0
 #define kLB_BundleID          "com.zan.wheresoundmeet.driver"
 #define kLB_Manufacturer      CFSTR("Zan")
 #define kLB_ModelUID          CFSTR("com.zan.wheresoundmeet.model")
@@ -31,6 +33,7 @@ enum { kLB_FirstDeviceID = 2, kLB_IDsPerSlot = 8 };
 #define LB_OutStreamID(slot) (LB_DeviceID(slot) + 2)
 #define LB_CapDeviceID(slot) (LB_DeviceID(slot) + 4)
 #define LB_CapInStreamID(slot) (LB_DeviceID(slot) + 5)
+#define LB_CapOutStreamID(slot) (LB_DeviceID(slot) + 6)
 #define LB_SlotForID(id)     (((id) - kLB_FirstDeviceID) / kLB_IDsPerSlot)
 #define LB_Offset(id)        (((id) - kLB_FirstDeviceID) % kLB_IDsPerSlot)
 #define LB_InRange(id)       ((id) >= kLB_FirstDeviceID && (id) < kLB_FirstDeviceID + kLB_MaxDevices * kLB_IDsPerSlot)
@@ -40,7 +43,8 @@ enum { kLB_FirstDeviceID = 2, kLB_IDsPerSlot = 8 };
 #define LB_IsInStream(id)    (LB_InRange(id) && LB_Offset(id) == 1)
 #define LB_IsOutStream(id)   (LB_InRange(id) && LB_Offset(id) == 2)
 #define LB_IsCapInStream(id) (LB_InRange(id) && LB_Offset(id) == 5)
-#define LB_IsStreamID(id)    (LB_IsInStream(id) || LB_IsOutStream(id) || LB_IsCapInStream(id))
+#define LB_IsCapOutStream(id) (LB_InRange(id) && LB_Offset(id) == 6)
+#define LB_IsStreamID(id)    (LB_IsInStream(id) || LB_IsOutStream(id) || LB_IsCapInStream(id) || LB_IsCapOutStream(id))
 
 typedef struct { UInt32 id; pid_t pid; } LBClient;
 
@@ -53,8 +57,23 @@ typedef struct {
     UInt64      anchorHostTime;
     UInt64      periodCounter;
     Float64     hostTicksPerFrame;
+    Float64     sampleRate;
+    Float64     pendingSampleRate;
     Float32    *ring;                /* owner loopback: kLB_RingFrames * kLB_Channels, interleaved */
     Float32    *passRing;            /* other clients' output, read by the hidden capture device */
+    /* Sample time up to which each ring holds this lap's data. Writers clear what lies beyond it
+       before mixing in; readers return silence past it. Reads never modify the rings, so any number
+       of IO contexts (aggregates, voice-processing units, plain clients) can read the same input. */
+    UInt64      ringFrontier;
+    UInt64      passFrontier;
+    os_unfair_lock ringLock;
+    os_unfair_lock passLock;
+    /* IO diagnostics, exposed through the plug-in debug string. */
+    UInt64      nRead, nCapRead, nProcOut, nProcOutOwner, nWriteMix, nStart, nStop, nClientsDropped;
+    UInt64      lastReadStart, lastCapReadStart, lastWriteStart;
+    UInt64      ringMaxBehind, passMaxBehind;       /* largest (frontier - writer start) seen */
+    UInt64      ringMaxReadBehind, passMaxReadBehind;
+    Float32     lastReadPeak, lastCapReadPeak, lastWritePeak;
     pthread_mutex_t ioMutex;
     LBClient    clients[kLB_MaxClients];
     UInt32      clientCount;

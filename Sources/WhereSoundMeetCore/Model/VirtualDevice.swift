@@ -33,10 +33,15 @@ public struct Source: Codable, Identifiable, Hashable {
     public var channelCount = 2
     public var effects = EffectSettings()
     /// App sources only: silence the app's normal output while it is captured, so it is heard only via monitors.
-    public var muteOriginal = true
+    /// Off by default: muting a voice-chat app (Discord) while tapping it starved its playout IO context.
+    public var muteOriginal = false
+    /// Extra delay (ms) on the path into the output channels only; direct wires to monitors stay undelayed.
+    /// Lets a singer's mic line up with music they hear late through Bluetooth headphones.
+    public var delayMs: Float = 0
+    public static let maxDelayMs: Float = 500
     public init(kind: SourceKind) { self.kind = kind }
 
-    enum CodingKeys: String, CodingKey { case id, kind, isOn, volume, channelCount, effects, muteOriginal }
+    enum CodingKeys: String, CodingKey { case id, kind, isOn, volume, channelCount, effects, muteOriginal, delayMs }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -46,7 +51,8 @@ public struct Source: Codable, Identifiable, Hashable {
         volume = try c.decodeIfPresent(Float.self, forKey: .volume) ?? 1
         channelCount = try c.decodeIfPresent(Int.self, forKey: .channelCount) ?? 2
         effects = try c.decodeIfPresent(EffectSettings.self, forKey: .effects) ?? EffectSettings()
-        muteOriginal = try c.decodeIfPresent(Bool.self, forKey: .muteOriginal) ?? true
+        muteOriginal = try c.decodeIfPresent(Bool.self, forKey: .muteOriginal) ?? false
+        delayMs = try c.decodeIfPresent(Float.self, forKey: .delayMs) ?? 0
     }
 }
 
@@ -75,8 +81,27 @@ public struct VirtualDevice: Codable, Identifiable, Hashable {
     public var outputChannels: [OutputChannel] = []
     public var monitors: [Monitor] = []
     public var wires: Set<Wire> = []
+    /// Keep this device as the system default output / input while it is on (apps that cannot pick a device follow it).
+    public var isDefaultOutput = false
+    public var isDefaultInput = false
 
     public init(name: String) { self.name = name }
+
+    enum CodingKeys: String, CodingKey { case id, name, isOn, volume, sources, outputChannels, monitors, wires, isDefaultOutput, isDefaultInput }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        isOn = try c.decodeIfPresent(Bool.self, forKey: .isOn) ?? true
+        volume = try c.decodeIfPresent(Float.self, forKey: .volume) ?? 1
+        sources = try c.decodeIfPresent([Source].self, forKey: .sources) ?? []
+        outputChannels = try c.decodeIfPresent([OutputChannel].self, forKey: .outputChannels) ?? []
+        monitors = try c.decodeIfPresent([Monitor].self, forKey: .monitors) ?? []
+        wires = try c.decodeIfPresent(Set<Wire>.self, forKey: .wires) ?? []
+        isDefaultOutput = try c.decodeIfPresent(Bool.self, forKey: .isDefaultOutput) ?? false
+        isDefaultInput = try c.decodeIfPresent(Bool.self, forKey: .isDefaultInput) ?? false
+    }
 
     public static func makeDefault(name: String = "Where Sound Meet Audio") -> VirtualDevice {
         var d = VirtualDevice(name: name)
@@ -158,6 +183,6 @@ public struct VirtualDevice: Codable, Identifiable, Hashable {
         let fromIsChannel = outputChannels.contains { $0.id == w.from.nodeID }
         let toIsChannel = outputChannels.contains { $0.id == w.to.nodeID }
         let toIsMonitor = monitors.contains { $0.id == w.to.nodeID }
-        return (fromIsSource && toIsChannel) || (fromIsChannel && toIsMonitor)
+        return (fromIsSource && toIsChannel) || (fromIsChannel && toIsMonitor) || (fromIsSource && toIsMonitor)
     }
 }

@@ -14,8 +14,11 @@ final class DeviceGraph: @unchecked Sendable {
 
     private var aggregateID: AudioObjectID = kAudioObjectUnknown
     private var procID: AudioDeviceIOProcID?
+    private var rateListener: AudioObjectPropertyListenerBlock?
     private var appTaps: [UUID: TapController.Tap] = [:]
     private var structureKey = ""
+    private var subUIDs: [String] = []
+    private var composition: [String: Any] = [:]
 
     /// Buffer index of the first input/output stream for each sub-device UID, and per tap UID.
     private var inputBufferForUID: [String: Int] = [:]
@@ -78,7 +81,7 @@ final class DeviceGraph: @unchecked Sendable {
     private static func structureKey(for d: VirtualDevice) -> String {
         let s = d.sources.map { src -> String in
             switch src.kind {
-            case .app(let b, _): return "app:\(b):\(src.muteOriginal):\(AudioSystem.processObjectIDs(bundleID: b))"
+            case .app(let b, _): return "app:\(b):\(src.muteOriginal)"
             case .inputDevice(let uid, _): return "in:\(uid)"
             case .passThru: return "pass"
             }
@@ -105,27 +108,28 @@ final class DeviceGraph: @unchecked Sendable {
             }
         }
 
-        var subUIDs: [String] = [device.driverUID]
-        if device.hasPassThru { subUIDs.append(device.passThruUID) }
+        var subUIDs: [String] = [device.passThruUID]
         for src in device.sources { if case .inputDevice(let uid, _) = src.kind, !subUIDs.contains(uid) { subUIDs.append(uid) } }
         for m in device.monitors where !subUIDs.contains(m.deviceUID) { subUIDs.append(m.deviceUID) }
-        // Hidden devices (Pass-Thru capture) are absent from the device list but resolve by UID.
+        // Hidden devices (the cap device) are absent from the device list but resolve by UID.
         subUIDs = subUIDs.filter { AudioSystem.deviceID(forUID: $0) != nil }
-        guard subUIDs.first == device.driverUID else { throw DriverError.coreAudio("Virtual device \(device.name) not found", -1) }
+        guard subUIDs.first == device.passThruUID else { throw DriverError.coreAudio("Virtual device \(device.name) not found", -1) }
+        self.subUIDs = subUIDs
 
         let desc: [String: Any] = [
             kAudioAggregateDeviceNameKey: "Where Sound Meet Graph \(device.name)",
             kAudioAggregateDeviceUIDKey: DriverProtocol.aggregateUIDPrefix + device.id.uuidString,
             kAudioAggregateDeviceIsPrivateKey: 1,
             kAudioAggregateDeviceIsStackedKey: 0,
-            kAudioAggregateDeviceMainSubDeviceKey: device.driverUID,
+            kAudioAggregateDeviceMainSubDeviceKey: device.passThruUID,
             kAudioAggregateDeviceSubDeviceListKey: subUIDs.map {
                 [kAudioSubDeviceUIDKey: $0,
-                 kAudioSubDeviceDriftCompensationKey: ($0 == device.driverUID || $0 == device.passThruUID) ? 0 : 1]
+                 kAudioSubDeviceDriftCompensationKey: ($0 == device.passThruUID) ? 0 : 1]
             },
             kAudioAggregateDeviceTapListKey: tapList,
             kAudioAggregateDeviceTapAutoStartKey: 1,
         ]
+        composition = desc
         var aggID: AudioObjectID = kAudioObjectUnknown
         let status = AudioHardwareCreateAggregateDevice(desc as CFDictionary, &aggID)
         guard status == noErr, aggID != kAudioObjectUnknown else { throw DriverError.coreAudio("Create aggregate device", status) }
@@ -140,6 +144,7 @@ final class DeviceGraph: @unchecked Sendable {
         mapBuffers(subUIDs: subUIDs)
         if let sr: Float64 = AudioSystem.scalarProperty(aggID, kAudioDevicePropertyNominalSampleRate), sr > 0 { sampleRate = sr }
         kernel.install(makePlan())
+        installRateListener(aggID)
 
         var pid: AudioDeviceIOProcID?
         let block: AudioDeviceIOBlock = { [unowned self] _, inData, _, outData, _ in
@@ -151,6 +156,73 @@ final class DeviceGraph: @unchecked Sendable {
         let s3 = AudioDeviceStart(aggID, pid)
         guard s3 == noErr else { teardown(); throw DriverError.coreAudio("Start device", s3) }
         Self.log.info("graph started for \(self.device.name, privacy: .public): inputs=\(self.inputChannels.count) outputs=\(self.outputChannels.count)")
+    }
+
+    /// Clients (e.g. iPad apps) may switch the virtual device's sample rate; rebuild effect chains to match.
+    private func installRateListener(_ aggID: AudioObjectID) {
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            Task { @MainActor in
+                guard let self, self.aggregateID == aggID,
+                      let sr: Float64 = AudioSystem.scalarProperty(aggID, kAudioDevicePropertyNominalSampleRate), sr > 0, sr != self.sampleRate
+                else { return }
+                Self.log.info("sample rate changed to \(sr) for \(self.device.name, privacy: .public)")
+                self.sampleRate = sr
+                self.chains = [:]
+                self.kernel.install(self.makePlan())
+            }
+        }
+        rateListener = block
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate, mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(aggID, &addr, .main, block)
+    }
+
+    /// Re-targets app taps after the system process list changed, keeping the aggregate and its IOProc alive.
+    /// Tearing the graph down for every process change restarted the tapped app's own IO (Discord's voice
+    /// context) and left it with a stale device handle; swapping taps in the composition does not.
+    func refreshTaps() {
+        guard aggregateID != kAudioObjectUnknown else { return }
+        var next = appTaps
+        var created: [TapController.Tap] = []
+        for src in device.sources {
+            guard case .app(let bundleID, _) = src.kind else { continue }
+            let procs = Set(AudioSystem.processObjectIDs(bundleID: bundleID))
+            // An app with no audio processes keeps its old tap: an empty process list would tap the whole system.
+            guard !procs.isEmpty else { continue }
+            if let tap = appTaps[src.id], Set(tap.processIDs) == procs { continue }
+            do {
+                let tap = try taps.makeProcessTap(bundleID: bundleID, muteOriginal: src.muteOriginal)
+                next[src.id] = tap
+                created.append(tap)
+            } catch {
+                Self.log.info("tap refresh skipped \(bundleID, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        guard !created.isEmpty else { return }
+        var desc = composition
+        desc[kAudioAggregateDeviceTapListKey] = device.sources.compactMap { src -> [String: Any]? in
+            guard case .app = src.kind, let tap = next[src.id] else { return nil }
+            return [kAudioSubTapUIDKey: tap.uid, kAudioSubTapDriftCompensationKey: 1]
+        }
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioAggregateDevicePropertyComposition,
+                                              mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        var cf = desc as CFDictionary
+        let status = AudioObjectSetPropertyData(aggregateID, &addr, 0, nil, UInt32(MemoryLayout<CFDictionary>.size), &cf)
+        guard status == noErr else {
+            Self.log.error("tap list update failed (\(status)), rebuilding \(self.device.name, privacy: .public)")
+            for tap in created { taps.destroy(tap) }
+            teardown()
+            try? build()
+            return
+        }
+        composition = desc
+        let old = appTaps
+        appTaps = next
+        for (id, tap) in old where next[id]?.objectID != tap.objectID { taps.destroy(tap) }
+        mapBuffers(subUIDs: subUIDs)
+        kernel.install(makePlan())
+        Self.log.info("taps refreshed for \(self.device.name, privacy: .public): \(created.count) new")
     }
 
     /// Aggregate buffers follow sub-device order (each sub-device's streams), then taps.
@@ -200,14 +272,16 @@ final class DeviceGraph: @unchecked Sendable {
             }
             guard let uid, let buf = inputBufferForUID[uid], buf < inputChannels.count else { continue }
             inputIndexForSource[src.id] = inputs.count
-            inputs.append(.init(offset: buf, channels: inputChannels[buf], gain: src.isOn ? src.volume : 0))
+            let delay = Int((Double(src.delayMs) / 1000 * sampleRate).rounded())
+            inputs.append(.init(offset: buf, channels: inputChannels[buf], gain: src.isOn ? src.volume : 0,
+                                delayFrames: min(max(delay, 0), MixKernel.maxDelayFrames)))
             syncChain(for: src, channels: inputChannels[buf], offset: buf, into: &nextChains, rt: &nextRT)
         }
         chains = nextChains
         let rtSnapshot = nextRT
         chainLock.withLock { rtChains = rtSnapshot }
         var outputs: [MixPlan.Output] = []
-        if let buf = outputBufferForUID[device.driverUID], buf < outputChannels.count {
+        if let buf = outputBufferForUID[device.passThruUID], buf < outputChannels.count {
             outputs.append(.init(offset: buf, channels: outputChannels[buf], gain: 1))
         }
         for m in device.monitors {
@@ -218,6 +292,7 @@ final class DeviceGraph: @unchecked Sendable {
         let busIndex = Dictionary(uniqueKeysWithValues: device.outputChannels.enumerated().map { ($1.id, $0) })
         var inputToBus: [MixPlan.InputWire] = []
         var busToOutput: [MixPlan.OutputWire] = []
+        var inputToOutput: [MixPlan.DirectWire] = []
         if !outputs.isEmpty {
             for b in 0..<min(device.outputChannels.count, outputs[0].channels) { busToOutput.append(.init(b, 0, b)) }
         }
@@ -226,10 +301,13 @@ final class DeviceGraph: @unchecked Sendable {
                 inputToBus.append(.init(ii, w.from.channel, bus))
             } else if let bus = busIndex[w.from.nodeID], let oi = outputIndexForMonitor[w.to.nodeID] {
                 busToOutput.append(.init(bus, oi, w.to.channel))
+            } else if let ii = inputIndexForSource[w.from.nodeID], let oi = outputIndexForMonitor[w.to.nodeID] {
+                inputToOutput.append(.init(ii, w.from.channel, oi, w.to.channel))
             }
         }
         return MixPlan(inputs: inputs, outputs: outputs, busCount: min(device.outputChannels.count, MixKernel.maxNodes),
-                       inputToBus: inputToBus, busToOutput: busToOutput, masterGain: device.isOn ? device.volume : 0)
+                       inputToBus: inputToBus, busToOutput: busToOutput, inputToOutput: inputToOutput,
+                       masterGain: device.isOn ? device.volume : 0)
     }
 
     // MARK: - Render (RT thread)
@@ -271,6 +349,12 @@ final class DeviceGraph: @unchecked Sendable {
 
     private func teardown() {
         if aggregateID != kAudioObjectUnknown {
+            if let rateListener {
+                var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate, mScope: kAudioObjectPropertyScopeGlobal,
+                                                      mElement: kAudioObjectPropertyElementMain)
+                AudioObjectRemovePropertyListenerBlock(aggregateID, &addr, .main, rateListener)
+            }
+            rateListener = nil
             if let procID {
                 AudioDeviceStop(aggregateID, procID)
                 AudioDeviceDestroyIOProcID(aggregateID, procID)

@@ -19,6 +19,7 @@ final class AudioEngine {
     private var timer: Timer?
     private var pendingDevices: [VirtualDevice] = []
     private var syncTask: Task<Void, Never>?
+    private var processTask: Task<Void, Never>?
     private var lastPushed: [String] = []
     private static let log = Logger(subsystem: DriverProtocol.appBundleID, category: "engine")
 
@@ -61,10 +62,14 @@ final class AudioEngine {
         apply(pendingDevices)
     }
 
-    /// Re-targets app taps after the process list changed.
+    /// Re-targets app taps after the process list changed. Coalesced: a tapped app starting voice spawns and
+    /// stops several helper processes within a second, and each swap used to trigger the next change.
     func processesChanged() {
-        for (id, g) in graphs {
-            if let d = pendingDevices.first(where: { $0.id == id }) { try? g.update(d) }
+        processTask?.cancel()
+        processTask = Task {
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            for g in graphs.values { g.refreshTaps() }
         }
     }
 
@@ -83,7 +88,6 @@ final class AudioEngine {
                 continue
             }
             do {
-                try DriverClient.setOwnerPID(deviceUID: d.driverUID, pid: ProcessInfo.processInfo.processIdentifier)
                 if let g = graphs[d.id] {
                     try g.update(d)
                 } else {

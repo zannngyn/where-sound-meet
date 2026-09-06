@@ -42,10 +42,25 @@ struct CardChrome<Body: View, Options: View>: View {
                     .padding(.horizontal, 12).padding(.bottom, 10)
             }
             Divider()
-            DisclosureGroup(isExpanded: $showOptions) {
-                options().padding(.top, 6)
-            } label: {
-                Text("Options").font(.callout)
+            // A Button, not a DisclosureGroup label: on macOS the label is inert and the card's tap gesture
+            // swallowed clicks, so the footer could not be opened.
+            VStack(alignment: .leading, spacing: 0) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { showOptions.toggle() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .rotationEffect(.degrees(showOptions ? 90 : 0))
+                        Text("Options").font(.callout)
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(showOptions ? "Hide" : "Show") options for \(title)")
+                .accessibilityAddTraits(showOptions ? [.isSelected] : [])
+                if showOptions { options().padding(.top, 6) }
             }
             .padding(.horizontal, 12).padding(.vertical, 8)
         }
